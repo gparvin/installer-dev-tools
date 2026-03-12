@@ -179,9 +179,36 @@ def get_component_from_pscomponent(pscomponent: str, component_map: Dict) -> Opt
 
     return None
 
+def extract_component_from_summary(summary: str) -> Optional[str]:
+    """
+    Extract component name from issue summary.
+    Patterns:
+      - "CVE-2025-13465 rhacm2/console-rhel9: prototype pollution..."
+      - "rhacm2/multicluster-operators-channel-rhel9: some issue"
+      - "multicluster-engine/hypershift-rhel9-operator: another issue"
+      - "gatekeeper/gatekeeper-rhel9: issue description"
+    """
+    if not summary:
+        return None
+
+    # Pattern: component_org/component_name
+    # Match org prefix followed by / and component name
+    # Component names can include letters, numbers, hyphens, and underscores
+    pattern = r'((?:rhacm2|multicluster-engine|multicluster-globalhub|gatekeeper)/[a-z0-9_-]+)'
+
+    match = re.search(pattern, summary, re.IGNORECASE)
+    if match:
+        # Extract the full component path (e.g., "rhacm2/console-rhel9")
+        full_match = match.group(1)
+        return full_match
+
+    return None
+
+
 def get_component_label(issue: Dict, component_map: Dict) -> Optional[str]:
-    """Extract component name from issue using pscomponent label."""
+    """Extract component name from issue using pscomponent label or summary."""
     labels = issue.get('fields', {}).get('labels', [])
+    summary = issue.get('fields', {}).get('summary', '')
 
     # For vulnerabilities, look for pscomponent label
     pscomponent = get_pscomponent_from_labels(labels)
@@ -192,7 +219,31 @@ def get_component_label(issue: Dict, component_map: Dict) -> Optional[str]:
         else:
             log_warning(f"Could not find component for pscomponent: {pscomponent}")
 
-    # Fallback: try to get from Jira component field
+    # Fallback 1: Extract component from summary
+    component_from_summary = extract_component_from_summary(summary)
+    if component_from_summary:
+        # Try to match against component registry
+        # The summary has format like "rhacm2/console-rhel9"
+        # Component registry might use different naming
+
+        # Try direct match first
+        if component_from_summary in component_map:
+            log_info(f"  Matched component from summary: {component_from_summary}")
+            return component_from_summary
+
+        # Try to find by matching prodseccomponent field
+        for comp_name, comp_info in component_map.items():
+            prodsec = comp_info.get('prodseccomponent', '')
+            if prodsec and component_from_summary in prodsec:
+                log_info(f"  Matched component from summary via prodsec: {comp_name}")
+                return comp_name
+
+        # If not in registry, use the extracted name as-is
+        # We'll construct the konflux component name from it
+        log_info(f"  Using component from summary (not in registry): {component_from_summary}")
+        return component_from_summary
+
+    # Fallback 2: try to get from Jira component field
     jira_components = issue.get('fields', {}).get('components', [])
     if jira_components:
         # Map Jira component name to registry component
@@ -209,23 +260,67 @@ def map_component_to_konflux(component_label: str, component_map: Dict, product:
     """
     Map component label to konflux component name with version suffix.
     Example: "console-mce" -> "console-mce-mce-26" or "console-acm-214"
+
+    Also handles components extracted from summary like "rhacm2/console-rhel9"
     """
     if not component_label:
         return None
 
+    # Check if component_label is from the registry
     component_info = component_map.get(component_label)
-    if not component_info:
-        log_warning(f"Component '{component_label}' not found in registry")
-        return None
+    if component_info:
+        konflux_component = component_info.get('konflux_component', '')
+        # Add version suffix
+        component_with_version = f"{konflux_component}-{short_version}"
+        return component_with_version
 
-    konflux_component = component_info.get('konflux_component', '')
+    # Component not in registry - might be from summary extraction
+    # Handle format like "rhacm2/console-rhel9" or "multicluster-engine/console-mce-rhel9"
+    if '/' in component_label:
+        # Extract component name part
+        parts = component_label.split('/')
+        if len(parts) == 2:
+            org, comp_name = parts
 
-    # Add version suffix
-    # The konflux_component already has product suffix (e.g., "console-mce")
-    # We need to add the version (e.g., "-26" or "-214")
-    component_with_version = f"{konflux_component}-{short_version}"
+            # Remove -rhel9, -rhel8 suffixes if present
+            comp_name_clean = re.sub(r'-rhel[0-9]+$', '', comp_name)
 
-    return component_with_version
+            # Determine version suffix format based on org
+            if 'multicluster-engine' in org.lower():
+                # MCE components: component-name-mce-29
+                # Check if component already has -mce suffix
+                if not comp_name_clean.endswith('-mce'):
+                    version_suffix = f"mce-{short_version}"
+                else:
+                    # Already has -mce, just add version number
+                    version_suffix = short_version
+            elif 'multicluster-globalhub' in org.lower():
+                # Global Hub components
+                if not comp_name_clean.endswith('-globalhub'):
+                    version_suffix = f"globalhub-{short_version}"
+                else:
+                    version_suffix = short_version
+            elif 'gatekeeper' in org.lower():
+                # Gatekeeper components
+                if not comp_name_clean.endswith('-gatekeeper'):
+                    version_suffix = f"gatekeeper-{short_version}"
+                else:
+                    version_suffix = short_version
+            else:
+                # ACM components (rhacm2): component-name-acm-214
+                # Check if component already has -acm suffix
+                if not comp_name_clean.endswith('-acm'):
+                    version_suffix = f"acm-{short_version}"
+                else:
+                    version_suffix = short_version
+
+            konflux_name = f"{comp_name_clean}-{version_suffix}"
+            log_info(f"  Constructed konflux name: {konflux_name}")
+            return konflux_name
+
+    # Last resort: use component_label as-is with version
+    log_warning(f"Component '{component_label}' not found in registry, using as-is")
+    return f"{component_label}-{short_version}"
 
 def process_issues(issues: List[Dict], component_map: Dict, product: str,
                    short_version: str) -> Tuple[List[str], List[Dict]]:
@@ -247,6 +342,7 @@ def process_issues(issues: List[Dict], component_map: Dict, product: str,
                 log_warning(f"Could not extract CVE from vulnerability issue {key}")
                 continue
 
+            log_info(f"  CVE: {cve_id} -> Processing CVE")
             # Get component from labels
             component_label = get_component_label(issue, component_map)
 
@@ -434,7 +530,9 @@ def main():
             f'project = "Red Hat Advanced Cluster Management" '
             f'AND fixVersion in ("{jira_fix_version}") '
             f'AND ( (labels in (doc-required, doc-require, doc-req) OR "SFDC Cases Counter" > 0) '
-            f'OR issuetype in (Vulnerability, Weakness) )'
+            f'OR issuetype in (Vulnerability, Weakness) ) '
+            f'AND status not in (New, "In Progress", Backlog) '
+            f'AND (resolution = Unresolved or resolution not in ("Not a Bug", "Won\'t Do"))'
         )
 
     # Query Jira
